@@ -59,3 +59,9 @@ CREATE TABLE IF NOT EXISTS receipts (
   result jsonb NOT NULL,
   PRIMARY KEY (workspace_id, actor_id, id)
 );
+
+-- Version 2. Legacy receipts still replay with the original result and fingerprint.
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS proposal jsonb;
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS resolved_by uuid;
+CREATE INDEX IF NOT EXISTS receipts_open_conflicts ON receipts(workspace_id, actor_id, id)
+  WHERE proposal IS NOT NULL AND resolved_by IS NULL;

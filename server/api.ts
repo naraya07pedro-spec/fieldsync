@@ -8,6 +8,7 @@ import type pg from 'pg';
 import type { WebSocket } from 'ws';
 import { mutation, uuid, type Profile } from '../lib/model';
 import { digest, sessionToken, validPassword } from './auth';
+import { transaction } from './db';
 import { mutate, snapshot } from './workspace';
 
 const credentials = z.strictObject({ email: z.email().max(254), password: z.string().min(1).max(128) });
@@ -23,7 +24,7 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
   const cookieName = secure ? '__Host-fieldsync' : 'fieldsync';
   const cookiePolicy = { path: '/', httpOnly: true, sameSite: 'strict' as const, secure };
   const app = Fastify({ bodyLimit: 16_384, logger: false });
-  const peers = new Map<WebSocket, { workspace: string; session: string }>();
+  const peers = new Map<WebSocket, { workspace: string; session: string; user: string }>();
   await app.register(cookie);
   await app.register(websocket, { options: { maxPayload: 1024 } });
   await app.register(throttle, { global: false });
@@ -31,8 +32,8 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
   async function identify(token?: string) {
     if (!token || !/^[\w-]{43}$/.test(token)) return null;
     const session = digest(token);
-    return (await pool.query<{ id: string; name: string; session: string }>(
-      `SELECT u.id, u.name, s.digest AS session FROM sessions s JOIN users u ON u.id=s.user_id
+    return (await pool.query<{ id: string; name: string; session: string; expires_at: Date }>(
+      `SELECT u.id, u.name, s.digest AS session, s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id
        WHERE s.digest=$1 AND s.expires_at > now()`, [session],
     )).rows[0] ?? null;
   }
@@ -72,16 +73,26 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
       const valid = await validPassword(input.data.password, account?.password);
       if (!valid || !account) return reply.code(401).send({ error: 'Invalid email or password' });
       const token = sessionToken();
-      await pool.query(
-        `INSERT INTO sessions (digest,user_id,expires_at) VALUES ($1,$2,now() + $3 * interval '1 second')`,
-        [digest(token), account.id, sessionSeconds],
-      );
+      const previous = request.cookies[cookieName];
+      await transaction(pool, async (db) => {
+        if (previous && /^[\w-]{43}$/.test(previous)) {
+          await db.query('DELETE FROM sessions WHERE digest=$1', [digest(previous)]);
+        }
+        await db.query(
+          `INSERT INTO sessions (digest,user_id,expires_at) VALUES ($1,$2,now() + $3 * interval '1 second')`,
+          [digest(token), account.id, sessionSeconds],
+        );
+      });
+      if (previous) for (const [socket, peer] of peers) if (peer.session === digest(previous)) socket.close(1008);
       return reply.setCookie(cookieName, token, { ...cookiePolicy, maxAge: sessionSeconds }).send({ ok: true });
     });
 
     api.post('/logout', async (request, reply) => {
       const session = await identify(request.cookies[cookieName]);
       if (session) {
+        if (request.headers['x-fieldsync-actor'] !== session.id) {
+          return reply.code(401).send({ error: 'Session changed' });
+        }
         await pool.query('DELETE FROM sessions WHERE digest=$1', [session.session]);
         for (const [socket, peer] of peers) if (peer.session === session.session) socket.close(1008);
       }
@@ -97,7 +108,7 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
          WHERE m.user_id=$1 ORDER BY w.name`,
         [id],
       );
-      return { id, name, workspaces: rows } satisfies Profile;
+      return { id, name, expiresAt: session.expires_at.toISOString(), workspaces: rows } satisfies Profile;
     });
 
     api.get<{Params: {id: string}}>('/workspaces/:id', async (request, reply) => {
@@ -105,8 +116,10 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
       if (!session) return reply.code(401).send({ error: 'Sign in required' });
       if (!uuid.safeParse(request.params.id).success) return reply.code(400).send({ error: 'Invalid workspace ID' });
       if (request.headers['x-fieldsync-actor'] !== session.id) return reply.code(401).send({ error: 'Session changed' });
-      const state = await snapshot(pool, request.params.id, session.id);
-      return state ?? reply.code(403).send({ error: 'Workspace access denied' });
+      const state = await snapshot(pool, request.params.id, session);
+      if (state.outcome === 'unauthenticated') return reply.code(401).send({ error: 'Sign in required' });
+      if (state.outcome === 'forbidden') return reply.code(403).send({ error: 'Workspace access denied' });
+      return state.value;
     });
 
     api.post<{Params: {id: string}}>('/workspaces/:id/mutations', async (request, reply) => {
@@ -118,15 +131,15 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
         return reply.code(400).send({ error: 'Invalid mutation' });
       }
       const workspace = request.params.id.toLowerCase();
-      const result = await mutate(pool, workspace, session.id, parsed.data);
+      const result = await mutate(pool, workspace, session, parsed.data);
+      if (result.outcome === 'unauthenticated') return reply.code(401).send({ error: 'Sign in required' });
       if (result.outcome === 'forbidden') return reply.code(403).send({ error: 'Workspace write denied' });
       if (result.outcome === 'key-reused') return reply.code(409).send({ error: 'Mutation ID already used for different content' });
-      if (!result.replay && result.receipt.status === 'applied') {
-        for (const [socket, peer] of peers) {
-          if (peer.workspace === workspace && socket.readyState === socket.OPEN) {
-            socket.send('changed', () => {});
-          }
-        }
+      if (!result.replay && result.receipt.status !== 'rejected') {
+        const targets = [...peers].filter(([,peer]) => peer.workspace === workspace);
+        const privateChange = result.receipt.status === 'conflict' || parsed.data.kind === 'conflict.keep';
+        const notify = privateChange ? targets.filter(([,peer]) => peer.user === session.id) : targets;
+        void updatePeers(notify, 'changed');
       }
       return result.receipt;
     });
@@ -150,32 +163,51 @@ export async function createApi(pool: pg.Pool, origin: string, webOrigin?: strin
       socket.on('message', () => socket.close(1008));
       const token = request.cookies[cookieName];
       const workspace = request.params.id.toLowerCase();
-      void identify(token).then((session) => {
+      void identify(token).then(async (session) => {
         if (!session || socket.readyState !== socket.OPEN) return socket.close(1008);
-        peers.set(socket, { workspace, session: session.session });
-        socket.send('ready', () => {});
+        const peer = { workspace, session: session.session, user: session.id };
+        peers.set(socket, peer);
+        await updatePeers([[socket, peer]], 'ready');
       }).catch(() => socket.close(1011));
     });
   }, { prefix: '/api' });
 
-  const timer = setInterval(async () => {
-    if (!peers.size) return;
+  async function updatePeers(targets: [WebSocket, {workspace: string; session: string; user: string}][], message?: string) {
+    if (!targets.length) return;
     try {
       const active = await pool.query<{session: string; workspace: string}>(
         `SELECT s.digest AS session, m.workspace_id AS workspace
          FROM sessions s JOIN memberships m ON m.user_id=s.user_id
-         WHERE s.digest=ANY($1::text[]) AND s.expires_at > now()`,
-        [[...new Set([...peers.values()].map((peer) => peer.session))]],
+         WHERE s.digest=ANY($1::text[]) AND s.expires_at > clock_timestamp()`,
+        [[...new Set(targets.map(([,peer]) => peer.session))]],
       );
       const allowed = new Set(active.rows.map((row) => row.session + row.workspace));
-      for (const [socket, peer] of peers) if (!allowed.has(peer.session + peer.workspace)) socket.close(1008);
+      for (const [socket, peer] of targets) {
+        if (socket.readyState !== socket.OPEN) continue;
+        if (!allowed.has(peer.session + peer.workspace)) socket.close(1008);
+        else if (message) socket.send(message, () => {});
+      }
     } catch {
-      for (const socket of peers.keys()) socket.close(1011);
+      for (const [socket] of targets) socket.close(1011);
     }
-  }, 15_000);
+  }
+
+  const timer = setInterval(() => void updatePeers([...peers]), 15_000);
   timer.unref();
   app.addHook('onClose', async () => clearInterval(timer));
 
-  if (webOrigin) await app.register(proxy, { upstream: webOrigin, websocket: true });
+  if (webOrigin) await app.register(proxy, {
+    upstream: webOrigin,
+    websocket: process.env.NODE_ENV !== 'production',
+    replyOptions: {
+      rewriteRequestHeaders(_request, headers) {
+        const forwarded = { ...headers };
+        delete forwarded.cookie;
+        delete forwarded.authorization;
+        delete forwarded['x-fieldsync-actor'];
+        return forwarded;
+      },
+    },
+  });
   return app;
 }

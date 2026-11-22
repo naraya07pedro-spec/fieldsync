@@ -1,15 +1,17 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import type { Mutation, Receipt, Snapshot } from './model';
+import { mutation, receiptSchema, snapshotSchema, type Mutation, type Receipt, type CachedSnapshot } from './model';
 import { checkpoint, enqueue, readLocal, updatePending, type Pending } from './local';
 
-export type Connection = 'Connecting' | 'Live' | 'Online' | 'Offline' | 'Access denied' | 'Sync unavailable';
+export type Connection = 'Connecting' | 'Live' | 'Online' | 'Offline' | 'Access denied' | 'Storage unavailable' | 'Sync unavailable';
 
 export function useSync(user: string, workspace: string, onSessionExpired: () => void) {
   const scope = user + ':' + workspace;
-  const [state, setState] = useState<Snapshot>();
+  const [state, setState] = useState<CachedSnapshot>();
   const [pending, setPending] = useState<Pending[]>([]);
+  const [damaged, setDamaged] = useState(0);
+  const [damagedSnapshot, setDamagedSnapshot] = useState(false);
   const [connection, setConnection] = useState<Connection>('Connecting');
   const notify = useRef<() => void>(() => {});
   const expired = useRef(onSessionExpired);
@@ -32,11 +34,14 @@ export function useSync(user: string, workspace: string, onSessionExpired: () =>
       if (!signal.aborted && !denied) {
         setState(cached.state);
         setPending(cached.pending);
+        setDamaged(cached.damaged);
+        setDamagedSnapshot(cached.damagedSnapshot);
       }
       return cached;
     }
 
     function checkAccess(response: Response) {
+      if (signal.aborted) return false;
       if (response.status === 401) {
         expired.current();
         return false;
@@ -45,6 +50,8 @@ export function useSync(user: string, workspace: string, onSessionExpired: () =>
         denied = true;
         setState(undefined);
         setPending([]);
+        setDamaged(0);
+        setDamagedSnapshot(false);
         setConnection('Access denied');
         socket?.close();
         return false;
@@ -57,25 +64,36 @@ export function useSync(user: string, workspace: string, onSessionExpired: () =>
       if (running) { again = true; return; }
       running = true;
       try {
-        const cached = await refresh();
         if (!navigator.onLine) {
+          await refresh();
           if (!denied) setConnection('Offline');
           return;
         }
         // Authorize the current session before transmitting locally queued data.
-        const boot = await fetch(endpoint, { headers, signal });
+        const requestSignal = () => AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
+        const boot = await fetch(endpoint, { headers, signal: requestSignal() });
         if (!checkAccess(boot)) return;
         if (!boot.ok) throw new Error('Workspace sync failed');
         denied = false;
-        await checkpoint(scope, await boot.json());
+        const initial = snapshotSchema.parse(await boot.json());
+        let cacheFailed = false;
+        let receiptFailed = false;
+        await checkpoint(scope, initial).catch(() => { cacheFailed = true; });
+        const cached = await refresh();
+        if (cacheFailed && !signal.aborted) setState(initial);
 
-        let wrote = false;
+        const open = new Set(initial.conflicts.map(({ operation }) => operation.id));
+        const confirmed = new Map<string, Receipt>();
         for (const item of cached.pending) {
-          if (item.receipt || signal.aborted) continue;
+          if (signal.aborted) return;
+          if (item.receipt?.status === 'rejected') continue;
+          if (item.receipt?.status === 'conflict' &&
+            (item.receipt.revision === undefined || open.has(item.operation.id))) continue;
           const response = await fetch(endpoint + '/mutations', {
             method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify(item.operation), signal,
+            body: JSON.stringify(item.operation), signal: requestSignal(),
           });
+          if (signal.aborted) return;
           if (response.status === 401) { expired.current(); return; }
           let receipt: Receipt;
           if ([400, 403, 409].includes(response.status)) {
@@ -83,19 +101,27 @@ export function useSync(user: string, workspace: string, onSessionExpired: () =>
             receipt = { status: 'rejected', reason: error };
           } else {
             if (!response.ok) throw new Error('Mutation sync failed');
-            receipt = await response.json() as Receipt;
+            receipt = receiptSchema.parse(await response.json());
           }
-          await updatePending(item, { ...item, receipt });
-          wrote ||= receipt.status === 'applied';
+          await updatePending(item, { ...item, receipt }).catch(() => { receiptFailed = true; });
+          if (receipt.status !== 'rejected') confirmed.set(item.operation.id, receipt);
         }
-        if (wrote) {
-          const current = await fetch(endpoint, { headers, signal });
-          if (!checkAccess(current)) return;
-          if (!current.ok) throw new Error('Checkpoint failed');
-          await checkpoint(scope, await current.json());
+        let current = initial;
+        if (confirmed.size) {
+          const response = await fetch(endpoint, { headers, signal: requestSignal() });
+          if (!checkAccess(response)) return;
+          if (!response.ok) throw new Error('Checkpoint failed');
+          current = snapshotSchema.parse(await response.json());
+          cacheFailed = await checkpoint(scope, current, confirmed).then(() => false, () => true);
         }
         await refresh();
-        if (!signal.aborted) setConnection(socket?.readyState === WebSocket.OPEN ? 'Live' : 'Online');
+        if (signal.aborted) return;
+        if (cacheFailed || receiptFailed) {
+          setState(current);
+          setConnection('Storage unavailable');
+        } else {
+          setConnection(socket?.readyState === WebSocket.OPEN ? 'Live' : 'Online');
+        }
       } catch {
         if (!signal.aborted) {
           await refresh().catch(() => {});
@@ -128,6 +154,7 @@ export function useSync(user: string, workspace: string, onSessionExpired: () =>
     }
 
     notify.current = () => {
+      void refresh().catch(() => {});
       outboxChannel.postMessage(scope);
       void sync();
     };
@@ -149,21 +176,24 @@ export function useSync(user: string, workspace: string, onSessionExpired: () =>
   }, [scope, user, workspace]);
 
   async function queue(op: Mutation) {
-    await enqueue(scope, op);
+    await enqueue(scope, mutation.parse(op));
     notify.current();
   }
 
-  async function decide(item: Pending, keep: boolean) {
-    if (keep && item.receipt?.status === 'conflict' && item.operation.kind === 'task.update') {
-      const operation = {
-        ...item.operation, id: crypto.randomUUID(), version: item.receipt.current.version, resolves: item.operation.id,
-      };
-      await updatePending(item, { scope, operation });
+  async function decide(item: Pending, keep: boolean, restored: boolean) {
+    if (item.receipt?.status === 'conflict' && item.operation.kind === 'task.update') {
+      const id = crypto.randomUUID();
+      const resolves = item.operation.id;
+      const operation: Mutation = keep
+        ? { ...item.operation, id, version: item.receipt.current.version, resolves }
+        : { kind: 'conflict.keep', id, entityId: item.operation.entityId, resolves, title: item.operation.title };
+      if (restored) await enqueue(scope, operation);
+      else if (!await updatePending(item, { scope, operation })) throw new Error('Conflict already changed');
     } else {
       await updatePending(item);
     }
     notify.current();
   }
 
-  return { state, pending, connection, queue, decide };
+  return { state, pending, connection, damaged, damagedSnapshot, queue, decide };
 }

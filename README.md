@@ -25,7 +25,7 @@ printf '%s\n' "$fieldsync_password" | npm run user:create -- "Field crew" alex@e
 unset fieldsync_password
 ```
 
-For a production-build demo, run `npm run build` and start `npm run start:web` and `npm run start:api` in separate terminals. Export `DATABASE_URL` in the gateway terminal. Open **http://localhost:3000**. Use browser profiles or isolated browser contexts to sign in simultaneously. For hot reload, use `npm run dev`. Offline reload uses the service worker from the production build.
+For a production-build demo, run `npm run build` and start `npm run start:web` and `NODE_ENV=production npm run start:api` in separate terminals. Export `DATABASE_URL` in the gateway terminal. Open **http://localhost:3000**. Use browser profiles or isolated browser contexts to sign in simultaneously. For hot reload, use `npm run dev`. Offline reload uses the service worker from the production build.
 
 Set `PUBLIC_ORIGIN` to the exact browser origin when it differs from the default. Non-loopback origins require HTTPS. See the [architecture](docs/architecture.md) for the deployment boundary.
 
@@ -36,6 +36,7 @@ Run these commands against a **disposable** database with the configuration abov
 ```bash
 npm run check
 npm run test:integration
+npm audit --audit-level=high
 npm run build
 npx playwright install --with-deps chromium
 FIELDSYNC_RESTART_DATABASE=1 npm run test:browser
@@ -47,6 +48,6 @@ The [GitHub Actions workflow](.github/workflows/ci.yml) runs the type check, int
 
 ## Project status
 
-The current scope is one same-origin Fastify gateway, one Next.js process, and PostgreSQL. See [architecture and remaining acceptance gates](docs/architecture.md).
+The current scope is one same-origin Fastify gateway, one Next.js process, and PostgreSQL. See the [architecture and remaining acceptance gates](docs/architecture.md) and the [threat model](docs/threat-model.md).
 
 Licensed under the [Apache License 2.0](LICENSE).

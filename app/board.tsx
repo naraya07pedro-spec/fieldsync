@@ -1,15 +1,14 @@
 'use client';
 
-import { useEffect, useState, type FormEvent } from 'react';
-import type { Profile, Snapshot, Task } from '../lib/model';
-import { cachedProfile, remember, type Pending } from '../lib/local';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { profileSchema, type Profile, type Snapshot, type Task } from '../lib/model';
+import { cachedProfile, forgetProfile, remember, type Pending } from '../lib/local';
 import { useSync } from '../lib/use-sync';
 
 async function prepareOffline() {
   if (!('serviceWorker' in navigator) || process.env.NODE_ENV !== 'production') return false;
   await navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' });
   const registration = await navigator.serviceWorker.ready;
-  const assets = performance.getEntriesByType('resource').map((entry) => entry.name);
   return new Promise<boolean>((resolve) => {
     const channel = new MessageChannel();
     const timeout = window.setTimeout(() => { channel.port1.close(); resolve(false); }, 8000);
@@ -18,12 +17,19 @@ async function prepareOffline() {
       channel.port1.close();
       resolve(event.data === true);
     };
-    registration.active?.postMessage({ kind: 'prime', assets }, [channel.port2]);
+    registration.active?.postMessage({ kind: 'prime' }, [channel.port2]);
   });
+}
+
+const profileMarker = 'fieldsync-offline-account';
+
+function markAccount(account: string) {
+  try { localStorage.setItem(profileMarker, account); } catch { /* Offline identity remains unavailable. */ }
 }
 
 export default function Board() {
   const [profile, setProfile] = useState<Profile>();
+  const authGeneration = useRef(0);
   const [checked, setChecked] = useState(false);
   const [error, setError] = useState('');
   const [working, setWorking] = useState(false);
@@ -35,23 +41,35 @@ export default function Board() {
     const channel = new BroadcastChannel('fieldsync-auth');
     let current = true;
     async function initialize() {
+      const generation = ++authGeneration.current;
+      const active = () => current && generation === authGeneration.current;
       try {
-        const response = await fetch('/api/me');
+        const response = await fetch('/api/me', { signal: AbortSignal.timeout(10_000) });
+        if (!active()) return;
         if (response.status === 401) {
-          await remember();
-          if (current) setProfile(undefined);
+          markAccount('');
+          setProfile(undefined);
+          await forgetProfile().catch(() => {});
         } else if (response.ok) {
-          const user: Profile = await response.json();
-          await remember(user);
-          if (current) setProfile(user);
+          const user = profileSchema.parse(await response.json());
+          if (!active()) return;
+          markAccount(user.id);
+          setProfile(user);
+          await remember(user).catch(() => {
+            if (active()) setError('Offline profile storage is unavailable on this device.');
+          });
         } else {
           throw new Error('Profile unavailable');
         }
       } catch {
         const cached = await cachedProfile().catch(() => undefined);
-        if (current) setProfile(cached);
+        const expected = (() => {
+          try { return localStorage.getItem(profileMarker); } catch { return null; }
+        })();
+        if (active()) setProfile(expected && cached?.id === expected && Date.parse(cached.expiresAt) > Date.now()
+          ? cached : undefined);
       } finally {
-        if (current) setChecked(true);
+        if (active()) setChecked(true);
       }
     }
     channel.onmessage = () => { setProfile(undefined); void initialize(); };
@@ -74,14 +92,25 @@ export default function Board() {
     channel.close();
   }
 
-  function expired() {
+  const expired = useCallback(() => {
+    const former = profile?.id;
     setProfile(undefined);
     setError('Sign in to resume synchronization. Queued changes are saved on this device.');
-    void remember().catch(() => {});
-  }
+    if (former) {
+      try { if (localStorage.getItem(profileMarker) === former) markAccount(''); } catch { /* Storage unavailable. */ }
+      void forgetProfile(former).catch(() => {});
+    }
+  }, [profile?.id]);
+
+  useEffect(() => {
+    if (!profile) return;
+    const timer = window.setTimeout(expired, Math.max(0, Date.parse(profile.expiresAt) - Date.now()));
+    return () => clearTimeout(timer);
+  }, [profile, expired]);
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const generation = ++authGeneration.current;
     const data = new FormData(event.currentTarget);
     setWorking(true);
     setError('');
@@ -96,10 +125,12 @@ export default function Board() {
       }
       const result = await fetch('/api/me');
       if (!result.ok) throw new Error();
-      const user: Profile = await result.json();
-      await remember(user);
+      const user = profileSchema.parse(await result.json());
+      if (generation !== authGeneration.current) return;
+      markAccount(user.id);
       setProfile(user);
       notifyAuth();
+      await remember(user).catch(() => setError('Offline profile storage is unavailable on this device.'));
     } catch {
       setError('Sign-in is unavailable. Check your connection and browser storage.');
     } finally {
@@ -108,22 +139,32 @@ export default function Board() {
   }
 
   async function logout() {
+    if (!profile || working) return;
+    setWorking(true);
     setError('');
     try {
-      const response = await fetch('/api/logout', { method: 'POST' });
-      if (!response.ok) throw new Error();
-      await remember();
+      const response = await fetch('/api/logout', {
+        method: 'POST', headers: { 'X-FieldSync-Actor': profile.id },
+      });
+      if (!response.ok && response.status !== 401) throw new Error();
+      const generation = ++authGeneration.current;
+      try { if (localStorage.getItem(profileMarker) === profile.id) markAccount(''); } catch { /* Storage unavailable. */ }
       setProfile(undefined);
       notifyAuth();
+      await forgetProfile(profile.id).catch(() => {
+        if (generation === authGeneration.current) setError('Signed out. Browser profile cleanup could not be completed.');
+      });
     } catch {
       setError('Reconnect to sign out.');
+    } finally {
+      setWorking(false);
     }
   }
 
   return <>
     <header className="top">
       <div className="brand"><span aria-hidden="true" className="mark">F</span> FieldSync</div>
-      {profile && <div className="identity"><span>{profile.name}</span><button className="secondary" onClick={logout}>Sign out</button></div>}
+      {profile && <div className="identity"><span>{profile.name}</span><button className="secondary" onClick={logout} disabled={working}>Sign out</button></div>}
     </header>
     <main>
       {error && <p role="alert" className="notice">{error}</p>}
@@ -145,7 +186,6 @@ export default function Board() {
                 {profile.workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
               </select></label>
             : <span>{active.name}</span>}
-          <span className="muted">{active.role}</span>
           {offlineReady && <span className="muted">Offline reload available</span>}
         </div>
         <Workspace key={profile.id + active.id} user={profile.id} workspace={active} onExpired={expired} />
@@ -157,17 +197,25 @@ export default function Board() {
 type WorkspaceProps = {user: string; workspace: Profile['workspaces'][number]; onExpired: () => void};
 
 function Workspace({ user, workspace, onExpired }: WorkspaceProps) {
-  const { state, pending, connection, queue, decide } = useSync(user, workspace.id, onExpired);
+  const { state, pending, connection, damaged, damagedSnapshot, queue, decide } = useSync(user, workspace.id, onExpired);
   const [error, setError] = useState('');
   const [selection, setSelection] = useState('');
-  const editable = workspace.role !== 'viewer' && connection !== 'Access denied';
+  const editable = (state?.role ?? workspace.role) !== 'viewer' && connection !== 'Access denied';
   const projects = state?.projects ?? [];
   const project = projects.find((item) => item.id === selection) ?? projects[0];
   const tasks = state?.tasks.filter((task) => task.projectId === project?.id) ?? [];
   const newProject = pending.filter((item) => item.operation.kind === 'project.create' && !item.receipt);
   const newTask = pending.filter((item) => item.operation.kind === 'task.create'
     && item.operation.projectId === project?.id && !item.receipt);
-  const attention = pending.filter((item) => item.receipt?.status === 'conflict' || item.receipt?.status === 'rejected');
+  const blocked = new Set(pending.map((item) => item.operation.entityId));
+  const tracked = new Set(pending.flatMap(({ operation }) => 'resolves' in operation && operation.resolves
+    ? [operation.id, operation.resolves] : [operation.id]));
+  const attention = [
+    ...pending.filter((item) => item.receipt?.status === 'conflict' || item.receipt?.status === 'rejected')
+      .map((item) => ({ item, restored: false })),
+    ...(state?.conflicts ?? []).filter(({ operation }) => !tracked.has(operation.id))
+      .map((entry) => ({ item: { ...entry, scope: user + ':' + workspace.id }, restored: true })),
+  ];
 
   async function submit(work: () => Promise<void>) {
     setError('');
@@ -186,13 +234,17 @@ function Workspace({ user, workspace, onExpired }: WorkspaceProps) {
       <div className="sync-status" aria-live="polite">
         <span data-connection={connection}>{connection}</span>
         <span>{pending.length} unsynced</span>
+        {state && <span>{state.role}</span>}
       </div>
     </div>
     {error && <p role="alert" className="notice">{error}</p>}
+    {damaged > 0 && <p role="alert" className="notice">Unreadable queued changes: {damaged}. The original records remain on this device.</p>}
+    {damagedSnapshot && <p role="alert" className="notice">The cached checklist is unreadable. Reconnect to refresh it.</p>}
     {attention.length > 0 && <section aria-label="Changes needing attention" className="panel attention">
       <h2>Changes needing attention</h2>
-      {attention.map((item) => <Conflict key={item.operation.id} item={item} members={state?.members ?? []}
-        onDecide={(keep) => void submit(() => decide(item, keep))} editable={editable} />)}
+      {attention.map(({ item, restored }) => <Conflict key={item.operation.id} item={item} members={state?.members ?? []}
+        onDecide={(keep) => void submit(() => decide(item, keep, restored))} editable={editable}
+        busy={restored && blocked.has(item.operation.entityId)} />)}
     </section>}
     {state && <div className="columns">
       <nav className="panel projects" aria-label="Projects">
@@ -257,8 +309,11 @@ function Workspace({ user, workspace, onExpired }: WorkspaceProps) {
   </>;
 }
 
-function Assignee({ members, value = '' }: {members: Snapshot['members']; value?: string}) {
-  return <select name="assignee" defaultValue={value}>
+function Assignee({ members, value = '', onChange }: {
+  members: Snapshot['members']; value?: string; onChange?: (value: string) => void;
+}) {
+  return <select name="assignee" value={onChange ? value : undefined} defaultValue={onChange ? undefined : value}
+    onChange={onChange ? (event) => onChange(event.target.value) : undefined}>
     <option value="">Unassigned</option>
     {members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}
   </select>;
@@ -269,13 +324,17 @@ function TaskRow({ task, pending, members, editable, save }: {
   save: (version: number, title: string, done: boolean, assigneeId: string | null) => Promise<boolean>;
 }) {
   const [draftBase, setDraftBase] = useState<Task>();
+  const [draft, setDraft] = useState(task);
   const optimistic = pending?.operation.kind === 'task.update' && (!pending.receipt || pending.receipt.status === 'applied')
     ? pending.operation : task;
   const assignee = members.find((item) => item.id === optimistic.assigneeId)?.name ?? 'Unassigned';
   return <article className="task" aria-label={task.title}>
     <div className="task-title"><span className="check-icon" aria-label={optimistic.done ? 'Complete' : 'Open'}>{optimistic.done ? '✓' : '○'}</span>
       <div><strong>{optimistic.title}</strong><span className="muted">{assignee}{pending ? ' · unsynced' : ''}</span></div>
-      {editable && !pending && <button className="secondary" onClick={() => setDraftBase(draftBase ? undefined : task)}>{draftBase ? 'Cancel' : 'Edit'}</button>}
+      {editable && !pending && <button className="secondary" onClick={() => {
+        if (!draftBase) setDraft(task);
+        setDraftBase(draftBase ? undefined : task);
+      }}>{draftBase ? 'Cancel' : 'Edit'}</button>}
     </div>
     {draftBase && editable && !pending && <form className="task-edit" onSubmit={(event) => {
       event.preventDefault();
@@ -284,16 +343,17 @@ function TaskRow({ task, pending, members, editable, save }: {
       if (title) void save(draftBase.version, title, data.get('done') === 'on', String(data.get('assignee')) || null)
         .then((saved) => { if (saved) setDraftBase(undefined); });
     }}>
-      <label>Task name<input name="title" defaultValue={draftBase.title} maxLength={160} required /></label>
-      <label>Assign to<Assignee members={members} value={draftBase.assigneeId ?? ''} /></label>
-      <label className="checkbox"><input type="checkbox" name="done" defaultChecked={draftBase.done} /> Complete</label>
+      <label>Task name<input name="title" value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} maxLength={160} required /></label>
+      <label>Assign to<Assignee members={members} value={draft.assigneeId ?? ''}
+        onChange={(assigneeId) => setDraft({ ...draft, assigneeId: assigneeId || null })} /></label>
+      <label className="checkbox"><input type="checkbox" name="done" checked={draft.done} onChange={(event) => setDraft({ ...draft, done: event.target.checked })} /> Complete</label>
       <button>Save task</button>
     </form>}
   </article>;
 }
 
-function Conflict({ item, members, editable, onDecide }: {
-  item: Pending; members: Snapshot['members']; editable: boolean; onDecide: (keep: boolean) => void;
+function Conflict({ item, members, editable, busy, onDecide }: {
+  item: Pending; members: Snapshot['members']; editable: boolean; busy: boolean; onDecide: (keep: boolean) => void;
 }) {
   const { operation, receipt } = item;
   function details(value: { done: boolean; assigneeId: string | null }) {
@@ -307,8 +367,8 @@ function Conflict({ item, members, editable, onDecide }: {
         <div><h3>Server version {receipt.current.version}</h3><strong>{receipt.current.title}</strong><p>{details(receipt.current)}</p></div>
       </div>
       <div className="actions">
-        {editable && <button onClick={() => onDecide(true)}>Use my edit</button>}
-        <button className="secondary" onClick={() => onDecide(false)}>Keep server version</button>
+        {editable && <button disabled={busy} onClick={() => onDecide(true)}>Use my edit</button>}
+        <button className="secondary" disabled={busy} onClick={() => onDecide(false)}>Keep server version</button>
       </div>
     </div>;
   }
