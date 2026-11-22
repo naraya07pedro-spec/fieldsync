@@ -1,0 +1,19 @@
+services:
+  db:
+    image: postgres:17.12-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73
+    environment:
+      POSTGRES_USER: fieldsync
+      POSTGRES_DB: fieldsync
+      POSTGRES_PASSWORD: ${FIELDSYNC_DB_PASSWORD:?Set a URL-safe password in .env}
+    ports:
+      - "127.0.0.1:${FIELDSYNC_DB_PORT:-5432}:5432"
+    volumes:
+      - data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "fieldsync", "-d", "fieldsync"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  data:

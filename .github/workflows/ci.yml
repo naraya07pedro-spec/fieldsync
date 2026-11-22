@@ -1,0 +1,54 @@
+name: FieldSync CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      FIELDSYNC_RESTART_DATABASE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - name: Start disposable PostgreSQL
+        shell: bash
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          {
+            printf 'FIELDSYNC_DB_PASSWORD=%s\n' "$password"
+            printf 'DATABASE_URL=postgresql://fieldsync:%s@127.0.0.1:5432/fieldsync\n' "$password"
+          } >> "$GITHUB_ENV"
+          FIELDSYNC_DB_PASSWORD="$password" docker compose up -d --wait
+      - run: npm run db:migrate
+      - run: npm run check
+      - run: npm run test:integration
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+      - name: Upload browser report and evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fieldsync-browser-evidence
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+      - name: Stop disposable PostgreSQL
+        if: always()
+        run: if [ -n "$FIELDSYNC_DB_PASSWORD" ]; then docker compose down -v; fi
